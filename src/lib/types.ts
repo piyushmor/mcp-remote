@@ -15,6 +15,22 @@ export class OAuthAuthorizationPendingError extends Error {
 }
 
 /**
+ * Raised after an interactive authorization was declined, interrupted, or
+ * timed out. Callers must retry after the deadline instead of opening another
+ * browser window for every concurrently spawned client.
+ */
+export class OAuthAuthorizationCooldownError extends Error {
+  readonly retryAt: number
+
+  constructor(retryAt: number) {
+    const remainingSeconds = Math.max(1, Math.ceil((retryAt - Date.now()) / 1000))
+    super(`OAuth authorization is cooling down; retry in ${remainingSeconds} seconds`)
+    this.name = 'OAuthAuthorizationCooldownError'
+    this.retryAt = retryAt
+  }
+}
+
+/**
  * Raised when a freshly exchanged token has not yet been accepted by the MCP
  * server. A second browser flow cannot make that token valid.
  */

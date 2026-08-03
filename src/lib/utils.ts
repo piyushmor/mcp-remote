@@ -7,6 +7,7 @@ import { OAuthError } from '@modelcontextprotocol/sdk/server/auth/errors.js'
 import { OAuthClientInformationFull, OAuthClientInformationFullSchema } from '@modelcontextprotocol/sdk/shared/auth.js'
 import {
   OAuthAuthorizationPendingError,
+  OAuthAuthorizationCooldownError,
   OAuthCallbackStateError,
   OAuthCallback,
   OAuthCallbackServerOptions,
@@ -349,8 +350,10 @@ export function mcpProxy({
   function isAuthorizationPendingError(error: Error): boolean {
     return (
       error instanceof OAuthAuthorizationPendingError ||
+      error instanceof OAuthAuthorizationCooldownError ||
       error instanceof OAuthTokenVerificationPendingError ||
       error.name === 'OAuthAuthorizationPendingError' ||
+      error.name === 'OAuthAuthorizationCooldownError' ||
       error.name === 'OAuthTokenVerificationPendingError'
     )
   }

@@ -90,6 +90,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
   private authorizationPrepared = false
   private sharedAuthorization = false
   private authorizationExchangeState = new AsyncLocalStorage<string>()
+  private observedTokens: OAuthTokens | undefined
 
   /**
    * Creates a new NodeOAuthClientProvider
@@ -276,6 +277,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     const tokens = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
 
     if (tokens) {
+      this.observedTokens = tokens
       const timeLeft = tokens.expires_in || 0
 
       // Alert if expires_in is invalid
@@ -331,6 +333,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     })
 
     await writeJsonFile(this.serverUrlHash, 'tokens.json', tokens)
+    this.observedTokens = tokens
     this.authorizationState = 'verifying'
   }
 
@@ -539,6 +542,7 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         ])
         this._clientInfo = undefined
         this.clientRegistrationSource = undefined
+        this.observedTokens = undefined
         this.resetAuthorizationState()
         debugLog('All credentials invalidated')
         break
@@ -551,11 +555,22 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
         break
 
       case 'tokens':
+        const currentTokens = await readJsonFile<OAuthTokens>(this.serverUrlHash, 'tokens.json', OAuthTokensSchema)
+        if (this.observedTokens && currentTokens && this.tokensDiffer(currentTokens, this.observedTokens)) {
+          // Another client completed a refresh after this process used the old
+          // refresh token. Deleting its replacement would turn one stale 401
+          // into a new login request for every client process.
+          this.observedTokens = currentTokens
+          this.resetAuthorizationState()
+          debugLog('Skipping token invalidation because another process refreshed the credentials')
+          break
+        }
         await Promise.all([
           deleteConfigFile(this.serverUrlHash, 'tokens.json'),
           deleteConfigFile(this.serverUrlHash, 'authorization.json'),
           deleteConfigFile(this.serverUrlHash, 'code_verifier.txt'),
         ])
+        this.observedTokens = undefined
         this.resetAuthorizationState()
         debugLog('OAuth tokens invalidated')
         break
@@ -604,5 +619,9 @@ export class NodeOAuthClientProvider implements OAuthClientProvider {
     this.authorizationPrepared = false
     this.sharedAuthorization = false
     this._state = randomUUID()
+  }
+
+  private tokensDiffer(current: OAuthTokens, observed: OAuthTokens): boolean {
+    return current.access_token !== observed.access_token || current.refresh_token !== observed.refresh_token
   }
 }

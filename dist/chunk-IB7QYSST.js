@@ -18158,6 +18158,15 @@ var OAuthAuthorizationPendingError = class extends Error {
     this.name = "OAuthAuthorizationPendingError";
   }
 };
+var OAuthAuthorizationCooldownError = class extends Error {
+  retryAt;
+  constructor(retryAt) {
+    const remainingSeconds = Math.max(1, Math.ceil((retryAt - Date.now()) / 1e3));
+    super(`OAuth authorization is cooling down; retry in ${remainingSeconds} seconds`);
+    this.name = "OAuthAuthorizationCooldownError";
+    this.retryAt = retryAt;
+  }
+};
 var OAuthTokenVerificationPendingError = class extends Error {
   constructor() {
     super("OAuth token is awaiting remote verification; retry the MCP request");
@@ -20088,6 +20097,25 @@ async function checkAuthorizationCompletion(serverUrlHash) {
   });
   return completion ?? null;
 }
+async function writeAuthorizationCooldown(serverUrlHash, retryAt) {
+  await writeJsonFile(serverUrlHash, "authorization-cooldown.json", {
+    retryAt
+  });
+}
+async function checkAuthorizationCooldown(serverUrlHash) {
+  const cooldown = await readJsonFile(serverUrlHash, "authorization-cooldown.json", {
+    async parseAsync(data) {
+      if (!data || typeof data !== "object") return null;
+      const candidate = data;
+      if (typeof candidate.retryAt !== "number" || !Number.isFinite(candidate.retryAt)) return null;
+      return candidate;
+    }
+  });
+  return cooldown ?? null;
+}
+async function deleteAuthorizationCooldown(serverUrlHash) {
+  await deleteConfigFile(serverUrlHash, "authorization-cooldown.json");
+}
 function getConfigDir() {
   const baseConfigDir = process.env.MCP_REMOTE_CONFIG_DIR || path.join(os.homedir(), ".mcp-auth");
   return path.join(baseConfigDir, `mcp-remote-${version2}`);
@@ -20556,7 +20584,7 @@ function mcpProxy({
     return error2.message.includes("Unauthorized");
   }
   function isAuthorizationPendingError(error2) {
-    return error2 instanceof OAuthAuthorizationPendingError || error2 instanceof OAuthTokenVerificationPendingError || error2.name === "OAuthAuthorizationPendingError" || error2.name === "OAuthTokenVerificationPendingError";
+    return error2 instanceof OAuthAuthorizationPendingError || error2 instanceof OAuthAuthorizationCooldownError || error2 instanceof OAuthTokenVerificationPendingError || error2.name === "OAuthAuthorizationPendingError" || error2.name === "OAuthAuthorizationCooldownError" || error2.name === "OAuthTokenVerificationPendingError";
   }
   function verifyRemoteAuthorization() {
     return new Promise((resolve, reject) => {
@@ -21319,6 +21347,7 @@ var NodeOAuthClientProvider = class {
   authorizationPrepared = false;
   sharedAuthorization = false;
   authorizationExchangeState = new AsyncLocalStorage();
+  observedTokens;
   /**
    * Marks a successfully processed MCP response as proof that the most
    * recently exchanged token is accepted by the remote resource server.
@@ -21453,6 +21482,7 @@ var NodeOAuthClientProvider = class {
     debugLog("Token request stack trace:", new Error().stack);
     const tokens = await readJsonFile(this.serverUrlHash, "tokens.json", OAuthTokensSchema);
     if (tokens) {
+      this.observedTokens = tokens;
       const timeLeft = tokens.expires_in || 0;
       if (typeof tokens.expires_in !== "number" || tokens.expires_in < 0) {
         debugLog("\u26A0\uFE0F WARNING: Invalid expires_in detected while reading tokens \u26A0\uFE0F", {
@@ -21499,6 +21529,7 @@ var NodeOAuthClientProvider = class {
       expiresInValue: tokens.expires_in
     });
     await writeJsonFile(this.serverUrlHash, "tokens.json", tokens);
+    this.observedTokens = tokens;
     this.authorizationState = "verifying";
   }
   /**
@@ -21677,6 +21708,7 @@ ${authorizationUrl.toString()}
         ]);
         this._clientInfo = void 0;
         this.clientRegistrationSource = void 0;
+        this.observedTokens = void 0;
         this.resetAuthorizationState();
         debugLog("All credentials invalidated");
         break;
@@ -21687,11 +21719,19 @@ ${authorizationUrl.toString()}
         debugLog("Client information invalidated");
         break;
       case "tokens":
+        const currentTokens = await readJsonFile(this.serverUrlHash, "tokens.json", OAuthTokensSchema);
+        if (this.observedTokens && currentTokens && this.tokensDiffer(currentTokens, this.observedTokens)) {
+          this.observedTokens = currentTokens;
+          this.resetAuthorizationState();
+          debugLog("Skipping token invalidation because another process refreshed the credentials");
+          break;
+        }
         await Promise.all([
           deleteConfigFile(this.serverUrlHash, "tokens.json"),
           deleteConfigFile(this.serverUrlHash, "authorization.json"),
           deleteConfigFile(this.serverUrlHash, "code_verifier.txt")
         ]);
+        this.observedTokens = void 0;
         this.resetAuthorizationState();
         debugLog("OAuth tokens invalidated");
         break;
@@ -21734,6 +21774,9 @@ ${authorizationUrl.toString()}
     this.sharedAuthorization = false;
     this._state = randomUUID2();
   }
+  tokensDiffer(current, observed) {
+    return current.access_token !== observed.access_token || current.refresh_token !== observed.refresh_token;
+  }
 };
 
 // src/lib/coordination.ts
@@ -21744,6 +21787,7 @@ var LEASE_GUARD_PORT_COUNT = 16384;
 var LEASE_GUARD_PORT_ATTEMPTS = 32;
 var LEASE_GUARD_RETRY_MS = 25;
 var LEASE_GUARD_PROBE_TIMEOUT_MS = 250;
+var AUTHORIZATION_COOLDOWN_MS = 6e4;
 function getLeaseGuardPort(serverUrlHash, attempt) {
   const initial = Number.parseInt(serverUrlHash.slice(0, 8), 16);
   const seed = Number.isNaN(initial) ? Array.from(serverUrlHash).reduce((total, character) => total + character.charCodeAt(0), 0) : initial;
@@ -21992,6 +22036,9 @@ function createLazyAuthCoordinator(serverUrlHash, callbackPort, events, authTime
         await withLeaseMutationGuard(serverUrlHash, state.authTimeoutMs, async () => {
           if (completed && state.leaseId) {
             await writeAuthorizationCompletion(serverUrlHash, state.leaseId);
+            await deleteAuthorizationCooldown(serverUrlHash);
+          } else if (!completed) {
+            await writeAuthorizationCooldown(serverUrlHash, Date.now() + AUTHORIZATION_COOLDOWN_MS);
           }
           await deleteLockfile(serverUrlHash, state.leaseId);
           await closeCallbackServer(state.server);
@@ -22099,6 +22146,13 @@ async function coordinateAuth(serverUrlHash, callbackPort, events, authTimeoutMs
       if (lockData) {
         log("Found invalid lockfile, deleting it");
         await deleteLockfile(serverUrlHash, lockData.leaseId);
+      }
+      const cooldown = await checkAuthorizationCooldown(serverUrlHash);
+      if (cooldown && cooldown.retryAt > Date.now()) {
+        throw new OAuthAuthorizationCooldownError(cooldown.retryAt);
+      }
+      if (cooldown) {
+        await deleteAuthorizationCooldown(serverUrlHash);
       }
       const claimedCallbackPort = callbackPort || await findAvailablePort();
       const claimedLease = await createLockfile(serverUrlHash, process.pid, claimedCallbackPort, authTimeoutMs);

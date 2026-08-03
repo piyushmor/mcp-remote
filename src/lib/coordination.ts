@@ -1,17 +1,20 @@
 import {
   checkAuthorizationCompletion,
+  checkAuthorizationCooldown,
   checkLockfile,
   createLockfile,
+  deleteAuthorizationCooldown,
   deleteLockfile,
   LockfileData,
   writeAuthorizationCompletion,
+  writeAuthorizationCooldown,
 } from './mcp-auth-config'
 import { EventEmitter } from 'events'
 import { Server } from 'http'
 import express from 'express'
 import net, { AddressInfo } from 'net'
 import { log, debugLog, findAvailablePort, setupOAuthCallbackServerWithLongPoll } from './utils'
-import type { OAuthCallback } from './types'
+import { OAuthAuthorizationCooldownError, type OAuthCallback } from './types'
 
 export type AuthCoordinator = {
   initializeAuth: () => Promise<{
@@ -61,6 +64,7 @@ const LEASE_GUARD_PORT_COUNT = 16_384
 const LEASE_GUARD_PORT_ATTEMPTS = 32
 const LEASE_GUARD_RETRY_MS = 25
 const LEASE_GUARD_PROBE_TIMEOUT_MS = 250
+const AUTHORIZATION_COOLDOWN_MS = 60_000
 
 type LeaseGuardProbeResult = 'guard' | 'unrelated' | 'ambiguous'
 
@@ -392,6 +396,9 @@ export function createLazyAuthCoordinator(
         await withLeaseMutationGuard(serverUrlHash, state.authTimeoutMs, async () => {
           if (completed && state.leaseId) {
             await writeAuthorizationCompletion(serverUrlHash, state.leaseId)
+            await deleteAuthorizationCooldown(serverUrlHash)
+          } else if (!completed) {
+            await writeAuthorizationCooldown(serverUrlHash, Date.now() + AUTHORIZATION_COOLDOWN_MS)
           }
           await deleteLockfile(serverUrlHash, state.leaseId)
           await closeCallbackServer(state.server)
@@ -527,6 +534,14 @@ export async function coordinateAuth(
       if (lockData) {
         log('Found invalid lockfile, deleting it')
         await deleteLockfile(serverUrlHash, lockData.leaseId)
+      }
+
+      const cooldown = await checkAuthorizationCooldown(serverUrlHash)
+      if (cooldown && cooldown.retryAt > Date.now()) {
+        throw new OAuthAuthorizationCooldownError(cooldown.retryAt)
+      }
+      if (cooldown) {
+        await deleteAuthorizationCooldown(serverUrlHash)
       }
 
       // Claim ownership before opening the callback server. Holding the

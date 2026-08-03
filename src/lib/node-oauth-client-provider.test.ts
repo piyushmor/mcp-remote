@@ -364,6 +364,26 @@ describe('NodeOAuthClientProvider - OAuth Scope Handling', () => {
       expect(mockDeleteConfigFile).toHaveBeenCalledWith('test-hash', 'tokens.json')
       expect(mockDeleteConfigFile).not.toHaveBeenCalledWith('test-hash', 'client_info.json')
     })
+
+    it('does not delete a token that another process refreshed after this provider read the old token', async () => {
+      provider = new NodeOAuthClientProvider(defaultOptions)
+      const oldTokens = {
+        access_token: 'old-access-token',
+        refresh_token: 'old-refresh-token',
+        token_type: 'Bearer',
+      }
+      const refreshedTokens = {
+        access_token: 'fresh-access-token',
+        refresh_token: 'fresh-refresh-token',
+        token_type: 'Bearer',
+      }
+      mockReadJsonFile.mockResolvedValueOnce(oldTokens).mockResolvedValueOnce(refreshedTokens)
+
+      await expect(provider.tokens()).resolves.toEqual(oldTokens)
+      await provider.invalidateCredentials('tokens')
+
+      expect(mockDeleteConfigFile).not.toHaveBeenCalled()
+    })
   })
 
   describe('scopes_supported parsing', () => {

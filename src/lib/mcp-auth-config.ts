@@ -24,6 +24,8 @@ import { log, MCP_REMOTE_VERSION } from './utils'
  * - {server_hash}_lock.json: Atomically claimed cross-process OAuth lease
  * - {server_hash}_authorization-completion.json: The latest completed lease,
  *   used only to let its already-waiting secondary clients consume saved tokens
+ * - {server_hash}_authorization-cooldown.json: A short retry deadline after
+ *   an owner failed or timed out before completing browser authorization
  *
  * All JSON files are stored with 2-space indentation and atomically published
  * by renaming a completed same-directory temporary file.
@@ -45,6 +47,10 @@ export interface LockfileData {
 export interface AuthorizationCompletionData {
   leaseId: string
   completedAt: number
+}
+
+export interface AuthorizationCooldownData {
+  retryAt: number
 }
 
 /**
@@ -158,6 +164,32 @@ export async function checkAuthorizationCompletion(serverUrlHash: string): Promi
     },
   })
   return completion ?? null
+}
+
+/**
+ * Stores the retry deadline for a failed browser authorization while the
+ * caller owns the OAuth lease-mutation guard.
+ */
+export async function writeAuthorizationCooldown(serverUrlHash: string, retryAt: number): Promise<void> {
+  await writeJsonFile(serverUrlHash, 'authorization-cooldown.json', {
+    retryAt,
+  } satisfies AuthorizationCooldownData)
+}
+
+export async function checkAuthorizationCooldown(serverUrlHash: string): Promise<AuthorizationCooldownData | null> {
+  const cooldown = await readJsonFile<AuthorizationCooldownData>(serverUrlHash, 'authorization-cooldown.json', {
+    async parseAsync(data: unknown) {
+      if (!data || typeof data !== 'object') return null
+      const candidate = data as Record<string, unknown>
+      if (typeof candidate.retryAt !== 'number' || !Number.isFinite(candidate.retryAt)) return null
+      return candidate as unknown as AuthorizationCooldownData
+    },
+  })
+  return cooldown ?? null
+}
+
+export async function deleteAuthorizationCooldown(serverUrlHash: string): Promise<void> {
+  await deleteConfigFile(serverUrlHash, 'authorization-cooldown.json')
 }
 
 /**

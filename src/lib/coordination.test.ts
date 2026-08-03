@@ -3,6 +3,7 @@ import { EventEmitter } from 'events'
 import { AddressInfo, createConnection, createServer } from 'net'
 import * as mcpAuthConfig from './mcp-auth-config'
 import { coordinateAuth, createLazyAuthCoordinator, isLockValid, waitForAuthentication } from './coordination'
+import { OAuthAuthorizationCooldownError } from './types'
 
 vi.mock('./mcp-auth-config', () => ({
   checkLockfile: vi.fn(),
@@ -10,11 +11,17 @@ vi.mock('./mcp-auth-config', () => ({
   createLockfile: vi.fn(),
   deleteLockfile: vi.fn(),
   writeAuthorizationCompletion: vi.fn(),
+  checkAuthorizationCooldown: vi.fn(),
+  writeAuthorizationCooldown: vi.fn(),
+  deleteAuthorizationCooldown: vi.fn(),
 }))
 
 afterEach(() => {
   vi.unstubAllGlobals()
   vi.clearAllMocks()
+  vi.mocked(mcpAuthConfig.checkAuthorizationCooldown).mockResolvedValue(null)
+  vi.mocked(mcpAuthConfig.writeAuthorizationCooldown).mockResolvedValue(undefined)
+  vi.mocked(mcpAuthConfig.deleteAuthorizationCooldown).mockResolvedValue(undefined)
 })
 
 describe('waitForAuthentication', () => {
@@ -324,6 +331,24 @@ describe('waitForAuthentication', () => {
     expect(nextAuth.skipBrowserAuth).toBe(false)
     expect(mcpAuthConfig.createLockfile).toHaveBeenCalledTimes(2)
     await new Promise<void>((resolve) => nextAuth.server.close(() => resolve()))
+  })
+
+  it('rejects a new authorization during the failed owner cooldown without claiming another callback server', async () => {
+    vi.mocked(mcpAuthConfig.checkLockfile).mockResolvedValue(null)
+    vi.mocked(mcpAuthConfig.createLockfile).mockResolvedValue({
+      pid: process.pid,
+      port: 0,
+      timestamp: Date.now(),
+      leaseId: 'failed-primary-lease',
+    })
+
+    const coordinator = createLazyAuthCoordinator('server-hash', 0, new EventEmitter(), 30_000)
+    const failedAuth = await coordinator.initializeAuth()
+    await failedAuth.abortAuthorization()
+
+    vi.mocked(mcpAuthConfig.checkAuthorizationCooldown).mockResolvedValue({ retryAt: Date.now() + 60_000 })
+    await expect(coordinateAuth('server-hash', 0, new EventEmitter(), 30_000)).rejects.toBeInstanceOf(OAuthAuthorizationCooldownError)
+    expect(mcpAuthConfig.createLockfile).toHaveBeenCalledOnce()
   })
 
   it('releases the callback port before another process can claim the next lease', async () => {
